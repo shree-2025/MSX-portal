@@ -1,0 +1,242 @@
+<?php
+require_once __DIR__ . '/includes/header.php';
+requireLogin();
+
+$userId = $_SESSION['user_id'];
+$error = '';
+$success = '';
+
+// Initialize user data with default values
+$user = [
+    'name' => '',
+    'email' => '',
+    'profile_photo' => ''
+];
+
+// Get current user data
+$stmt = $conn->prepare("SELECT full_name, email, profile_photo FROM users WHERE id = ?");
+$stmt->bind_param('i', $userId);
+$stmt->execute();
+$result = $stmt->get_result();
+if ($userData = $result->fetch_assoc()) {
+    $user = array_merge($user, $userData);
+}
+
+// Handle form submission
+if ($_SERVER['REQUEST_METHOD'] === 'POST') {
+    $name = trim($_POST['full_name'] ?? '');
+    $email = trim($_POST['email'] ?? '');
+    $currentPassword = $_POST['current_password'] ?? '';
+    $newPassword = $_POST['new_password'] ?? '';
+    $confirmPassword = $_POST['confirm_password'] ?? '';
+    
+    // Basic validation
+    if (empty($name)) {
+        $error = 'Name is required';
+    } elseif (!filter_var($email, FILTER_VALIDATE_EMAIL)) {
+        $error = 'Please enter a valid email address';
+    } else {
+        // Check if email is already taken
+        $checkEmail = $conn->prepare("SELECT id FROM users WHERE email = ? AND id != ?");
+        $checkEmail->bind_param('si', $email, $userId);
+        $checkEmail->execute();
+        if ($checkEmail->get_result()->num_rows > 0) {
+            $error = 'Email is already in use';
+        }
+    }
+    
+    // Process password change if requested
+    if (empty($error) && (!empty($currentPassword) || !empty($newPassword) || !empty($confirmPassword))) {
+        if (empty($currentPassword)) {
+            $error = 'Current password is required to change password';
+        } else {
+            // Verify current password
+            $checkPass = $conn->prepare("SELECT password FROM users WHERE id = ?");
+            $checkPass->bind_param('i', $userId);
+            $checkPass->execute();
+            $storedHash = $checkPass->get_result()->fetch_assoc()['password'];
+            
+            if (!password_verify($currentPassword, $storedHash)) {
+                $error = 'Current password is incorrect';
+            } elseif (strlen($newPassword) < 8) {
+                $error = 'New password must be at least 8 characters long';
+            } elseif ($newPassword !== $confirmPassword) {
+                $error = 'New passwords do not match';
+            }
+        }
+    }
+    
+    // Handle file upload
+    $profilePhoto = $user['profile_photo'];
+    if (empty($error) && isset($_FILES['profile_photo']) && $_FILES['profile_photo']['error'] === UPLOAD_ERR_OK) {
+        $uploadDir = __DIR__ . '/uploads/profile_photos/';
+        if (!file_exists($uploadDir)) {
+            mkdir($uploadDir, 0777, true);
+        }
+        
+        $fileExt = strtolower(pathinfo($_FILES['profile_photo']['name'], PATHINFO_EXTENSION));
+        $allowedExts = ['jpg', 'jpeg', 'png', 'gif'];
+        
+        if (!in_array($fileExt, $allowedExts)) {
+            $error = 'Only JPG, JPEG, PNG & GIF files are allowed';
+        } else {
+            $newFilename = 'user_' . $userId . '_' . time() . '.' . $fileExt;
+            $targetPath = $uploadDir . $newFilename;
+            
+            if (move_uploaded_file($_FILES['profile_photo']['tmp_name'], $targetPath)) {
+                // Delete old profile photo if it exists and is not the default
+                if (!empty($profilePhoto) && $profilePhoto !== 'default.jpg' && file_exists($uploadDir . $profilePhoto)) {
+                    unlink($uploadDir . $profilePhoto);
+                }
+                $profilePhoto = $newFilename;
+            } else {
+                $error = 'Failed to upload profile photo';
+            }
+        }
+    }
+    
+    // Update user data if no errors
+    if (empty($error)) {
+        if (!empty($newPassword)) {
+            $hashedPassword = password_hash($newPassword, PASSWORD_DEFAULT);
+            $stmt = $conn->prepare("UPDATE users SET name = ?, email = ?, password = ?, profile_photo = ? WHERE id = ?");
+            $stmt->bind_param('ssssi', $name, $email, $hashedPassword, $profilePhoto, $userId);
+        } else {
+            $stmt = $conn->prepare("UPDATE users SET name = ?, email = ?, profile_photo = ? WHERE id = ?");
+            $stmt->bind_param('sssi', $name, $email, $profilePhoto, $userId);
+        }
+        
+        if ($stmt->execute()) {
+            $success = 'Profile updated successfully';
+            // Refresh user data
+            $stmt = $conn->prepare("SELECT name, email, profile_photo FROM users WHERE id = ?");
+            $stmt->bind_param('i', $userId);
+            $stmt->execute();
+            $result = $stmt->get_result();
+            $user = $result->fetch_assoc();
+        } else {
+            $error = 'Failed to update profile: ' . $conn->error;
+        }
+    }
+}
+?>
+
+<div class="min-h-screen bg-gray-50">
+    <div class="container mx-auto px-4 py-8">
+        <div class="max-w-3xl mx-auto">
+            <h1 class="text-2xl font-bold text-gray-900 mb-8">My Profile</h1>
+            
+            <?php if ($error): ?>
+                <div class="mb-6 p-4 bg-red-50 text-red-700 rounded-md">
+                    <?= htmlspecialchars($error) ?>
+                </div>
+            <?php endif; ?>
+            
+            <?php if ($success): ?>
+                <div class="mb-6 p-4 bg-green-50 text-green-700 rounded-md">
+                    <?= htmlspecialchars($success) ?>
+                </div>
+            <?php endif; ?>
+            
+            <div class="bg-white shadow overflow-hidden sm:rounded-lg">
+                <div class="px-4 py-5 sm:px-6 bg-gray-50">
+                    <h3 class="text-lg leading-6 font-medium text-gray-900">Profile Information</h3>
+                    <p class="mt-1 max-w-2xl text-sm text-gray-500">Update your account's profile information and email address.</p>
+                </div>
+                
+                <form method="POST" enctype="multipart/form-data" class="divide-y divide-gray-200">
+                    <div class="px-4 py-5 sm:p-6">
+                        <div class="grid grid-cols-1 gap-y-6 gap-x-4 sm:grid-cols-6">
+                            <!-- Profile Photo -->
+                            <div class="sm:col-span-6">
+                                <div class="flex items-center">
+                                    <div class="h-16 w-16 rounded-full overflow-hidden bg-gray-100">
+                                        <?php $photoPath = !empty($user['profile_photo']) ? 'uploads/profile_photos/' . $user['profile_photo'] : 'https://ui-avatars.com/api/?name=' . urlencode($user['name']) . '&background=4f46e5&color=fff&size=128'; ?>
+                                        <img id="profile-photo-preview" src="<?= htmlspecialchars($photoPath) ?>" alt="Profile Photo" class="h-full w-full object-cover">
+                                    </div>
+                                    <div class="ml-4">
+                                        <label for="profile_photo" class="cursor-pointer inline-flex items-center px-4 py-2 border border-gray-300 shadow-sm text-sm font-medium rounded-md text-gray-700 bg-white hover:bg-gray-50 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-indigo-500">
+                                            <i class="fas fa-upload mr-2"></i> Change Photo
+                                            <input type="file" id="profile_photo" name="profile_photo" class="sr-only" accept="image/*" onchange="previewImage(this)">
+                                        </label>
+                                        <p class="mt-1 text-xs text-gray-500">JPG, PNG or GIF (Max 2MB)</p>
+                                    </div>
+                                </div>
+                            </div>
+                            
+                            <!-- Name -->
+                            <div class="sm:col-span-6">
+                                <label for="name" class="block text-sm font-medium text-gray-700">Full Name</label>
+                                <input type="text" name="name" id="name" required
+                                       value="<?= htmlspecialchars($user['name'] ?? '') ?>"
+                                       class="mt-1 block w-full border border-gray-300 rounded-md shadow-sm py-2 px-3 focus:outline-none focus:ring-indigo-500 focus:border-indigo-500 sm:text-sm">
+                            </div>
+                            
+                            <!-- Email -->
+                            <div class="sm:col-span-6">
+                                <label for="email" class="block text-sm font-medium text-gray-700">Email Address</label>
+                                <input type="email" name="email" id="email" required
+                                       value="<?= htmlspecialchars($user['email'] ?? '') ?>"
+                                       class="mt-1 block w-full border border-gray-300 rounded-md shadow-sm py-2 px-3 focus:outline-none focus:ring-indigo-500 focus:border-indigo-500 sm:text-sm">
+                            </div>
+                        </div>
+                    </div>
+                    
+                    <!-- Password Update Section -->
+                    <div class="px-4 py-5 sm:p-6">
+                        <h3 class="text-lg leading-6 font-medium text-gray-900 mb-4">Update Password</h3>
+                        <div class="grid grid-cols-1 gap-y-6 gap-x-4 sm:grid-cols-6">
+                            <!-- Current Password -->
+                            <div class="sm:col-span-6">
+                                <label for="current_password" class="block text-sm font-medium text-gray-700">Current Password</label>
+                                <input type="password" name="current_password" id="current_password"
+                                       class="mt-1 block w-full border border-gray-300 rounded-md shadow-sm py-2 px-3 focus:outline-none focus:ring-indigo-500 focus:border-indigo-500 sm:text-sm"
+                                       placeholder="Leave blank to keep current password">
+                            </div>
+                            
+                            <!-- New Password -->
+                            <div class="sm:col-span-6">
+                                <label for="new_password" class="block text-sm font-medium text-gray-700">New Password</label>
+                                <input type="password" name="new_password" id="new_password"
+                                       class="mt-1 block w-full border border-gray-300 rounded-md shadow-sm py-2 px-3 focus:outline-none focus:ring-indigo-500 focus:border-indigo-500 sm:text-sm"
+                                       placeholder="Leave blank to keep current password">
+                            </div>
+                            
+                            <!-- Confirm New Password -->
+                            <div class="sm:col-span-6">
+                                <label for="confirm_password" class="block text-sm font-medium text-gray-700">Confirm New Password</label>
+                                <input type="password" name="confirm_password" id="confirm_password"
+                                       class="mt-1 block w-full border border-gray-300 rounded-md shadow-sm py-2 px-3 focus:outline-none focus:ring-indigo-500 focus:border-indigo-500 sm:text-sm"
+                                       placeholder="Leave blank to keep current password">
+                            </div>
+                        </div>
+                    </div>
+                    
+                    <!-- Form Actions -->
+                    <div class="px-4 py-3 bg-blue-50 text-right sm:px-6">
+                        <button type="submit"
+                                class="inline-flex justify-center py-2 px-4 border border-transparent shadow-sm text-sm font-medium rounded-md text-white bg-indigo-600 hover:bg-indigo-700 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-indigo-500">
+                            Save Changes
+                        </button>
+                    </div>
+                </form>
+            </div>
+        </div>
+    </div>
+</div>
+
+<script>
+function previewImage(input) {
+    if (input.files && input.files[0]) {
+        const reader = new FileReader();
+        
+        reader.onload = function(e) {
+            document.getElementById('profile-photo-preview').src = e.target.result;
+        }
+        
+        reader.readAsDataURL(input.files[0]);
+    }
+}
+</script>
+
+<?php require_once __DIR__ . '/includes/footer.php'; ?>

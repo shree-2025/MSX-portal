@@ -1,0 +1,964 @@
+<?php
+require_once __DIR__ . '/config/config.php';
+require_once __DIR__ . '/includes/auth_functions.php';
+require_once __DIR__ . '/includes/zegocloud_helper.php';
+
+// Check if user is logged in
+if (!isLoggedIn()) {
+    $_SESSION['redirect_after_login'] = $_SERVER['REQUEST_URI'];
+    header('Location: login.php');
+    exit();
+}
+
+// Get meeting ID from URL
+$meeting_id = $_GET['meeting'] ?? '';
+if (empty($meeting_id)) {
+    setFlashMessage('error', 'No meeting ID provided');
+    header('Location: index.php');
+    exit();
+}
+
+// Debug: Log the meeting ID being looked up
+error_log("Looking up meeting with ID: " . $meeting_id);
+
+// Get meeting details
+$stmt = $conn->prepare("SELECT * FROM video_meetings WHERE meeting_id = ? LIMIT 1");
+$stmt->bind_param('s', $meeting_id);
+$stmt->execute();
+$meeting = $stmt->get_result()->fetch_assoc();
+
+if (!$meeting) {
+    setFlashMessage('error', 'Meeting not found');
+    header('Location: ' . (isAdmin() ? 'admin/meetings.php' : 'student/dashboard.php'));
+    exit();
+}
+
+// Check if meeting has started/ended
+$start_time = new DateTime($meeting['start_time']);
+$end_time = (clone $start_time)->add(new DateInterval("PT{$meeting['duration']}M"));
+$now = new DateTime();
+
+if (($now < $start_time || $now > $end_time) && !isAdmin()) {
+    setFlashMessage('error', 'This meeting is not currently active');
+    header('Location: ' . (isAdmin() ? 'admin/meeting_details.php?id='.$meeting['id'] : 'student/dashboard.php'));
+    exit();
+}
+
+// Update participant status
+$stmt = $conn->prepare("
+    INSERT INTO meeting_participants (meeting_id, user_id, role, status, joined_at)
+    VALUES (?, ?, IF(? = created_by, 'host', 'participant'), 'joined', NOW())
+    ON DUPLICATE KEY UPDATE status = 'joined', joined_at = NOW()
+");
+$stmt->bind_param('iii', $meeting['id'], $_SESSION['user_id'], $_SESSION['user_id']);
+$stmt->execute();
+
+// Generate ZEGOCLOUD token
+$zegocloud = new ZegoCloudHelper();
+$tokenInfo = $zegocloud->generateToken(
+    'user_' . $_SESSION['user_id'], // User ID
+    $meeting_id, // Room ID (meeting ID)
+    24 * 3600 // 24 hours token expiration
+);
+
+// Prepare user info
+$user_info = [
+    'userID' => 'user_' . $_SESSION['user_id'],
+    'userName' => htmlspecialchars($_SESSION['username'] ?? 'Participant'),
+    'isHost' => ($meeting['host_id'] == $_SESSION['user_id'])
+];
+?>
+
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Join Meeting: <?php echo htmlspecialchars($meeting['title']); ?></title>
+    <!-- ZEGOCLOUD Web SDK -->
+    <script src="https://unpkg.com/zego-zim-web@latest/dist/index.js"></script>
+    <script src="https://unpkg.com/@zegocloud/zego-uikit-prebuilt/zego-uikit-prebuilt.js"></script>
+    <script src="https://unpkg.com/zego-express-engine-webrtc@latest/ZegoExpressEngine.js"></script>
+    <style>
+        * {
+            box-sizing: border-box;
+            margin: 0;
+            padding: 0;
+        }
+        
+        body, html { 
+            margin: 0; 
+            padding: 0; 
+            height: 100%; 
+            width: 100%;
+            overflow: hidden; 
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, Cantarell, 'Open Sans', 'Helvetica Neue', sans-serif;
+            background: #1a1a1a;
+            color: white;
+        }
+        
+        #meeting-container {
+            display: flex;
+            flex-direction: column;
+            height: 100vh;
+            width: 100%;
+        }
+        
+        #video-container {
+            flex: 1;
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+            gap: 10px;
+            padding: 10px;
+            background: #121212;
+            overflow-y: auto;
+        }
+        
+        .video-item {
+            background: #2d2d2d;
+            border-radius: 8px;
+            overflow: hidden;
+            position: relative;
+            aspect-ratio: 16/9;
+            min-height: 200px;
+            box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1);
+        }
+        
+        .video-item video {
+            width: 100%;
+            height: 100%;
+            object-fit: cover;
+            background: #000;
+        }
+        
+        .user-info {
+            position: absolute;
+            bottom: 10px;
+            left: 10px;
+            background: rgba(0, 0, 0, 0.7);
+            color: white;
+            padding: 4px 12px;
+            border-radius: 20px;
+            font-size: 14px;
+            font-weight: 500;
+            z-index: 10;
+        }
+        
+        #controls {
+            background: #2d2d2d;
+            padding: 15px 0;
+            display: flex;
+            justify-content: center;
+            gap: 20px;
+            box-shadow: 0 -2px 10px rgba(0, 0, 0, 0.3);
+        }
+        
+        .control-btn {
+            background: #4a4a4a;
+            border: none;
+            border-radius: 50%;
+            width: 50px;
+            height: 50px;
+            color: white;
+            cursor: pointer;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            transition: all 0.2s ease;
+            font-size: 20px;
+        }
+        
+        .control-btn:hover {
+            background: #5a5a5a;
+            transform: scale(1.1);
+        }
+        
+        .control-btn.end-call {
+            background: #e74c3c;
+            width: 60px;
+            height: 60px;
+            margin: 0 10px;
+        }
+        
+        .control-btn.end-call:hover {
+            background: #c0392b;
+            transform: scale(1.1);
+        }
+        
+        /* Loading state */
+        .loading {
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            height: 100%;
+            font-size: 18px;
+            color: #aaa;
+        }
+        
+        /* Responsive adjustments */
+        @media (max-width: 768px) {
+            #video-container {
+                grid-template-columns: 1fr;
+            }
+            
+            .video-item {
+                height: auto;
+                min-height: 0;
+            }
+            
+            .control-btn {
+                width: 45px;
+                height: 45px;
+                font-size: 18px;
+            }
+            
+            .control-btn.end-call {
+                width: 50px;
+                height: 50px;
+            }
+        }
+    </style>
+</head>
+<body>
+    <div id="meeting-container">
+        <div id="video-container">
+            <!-- Video streams will be added here dynamically -->
+        </div>
+        <div id="controls">
+            <button class="control-btn" id="toggle-video">
+                <i class="fas fa-video"></i>
+            </button>
+            <button class="control-btn" id="toggle-mic">
+                <i class="fas fa-microphone"></i>
+            </button>
+            <button class="control-btn end-call" id="end-call">
+                <i class="fas fa-phone"></i>
+            </button>
+        </div>
+    </div>
+
+    <script>
+        // ZEGOCLOUD configuration
+        const appID = '<?php echo ZEGOCLOUD_APP_ID; ?>';
+        const serverSecret = '<?php echo ZEGOCLOUD_SERVER_SECRET; ?>';
+        const tokenInfo = <?php echo json_encode($tokenInfo); ?>;
+        const userInfo = <?php echo json_encode($user_info); ?>;
+        const meetingId = '<?php echo $meeting_id; ?>';
+        
+        // Show loading state
+        const videoContainer = document.getElementById('video-container');
+        videoContainer.innerHTML = `
+            <div class="loading">
+                <div class="text-center">
+                    <div class="spinner-border text-primary mb-2" role="status">
+                        <span class="visually-hidden">Loading...</span>
+                    </div>
+                    <p>Connecting to meeting...</p>
+                </div>
+            </div>`;
+        
+        // Initialize ZEGOCLOUD
+        let zg;
+        try {
+            zg = new ZegoExpressEngine(appID, 'wss://webrtc-live.zego.im/ws');
+            console.log('ZegoExpressEngine initialized successfully');
+        } catch (error) {
+            console.error('Failed to initialize ZegoExpressEngine:', error);
+            showError('Failed to initialize video meeting. Please try again.');
+        }
+        
+        // DOM Elements
+        const toggleVideoBtn = document.getElementById('toggle-video');
+        const toggleMicBtn = document.getElementById('toggle-mic');
+        const endCallBtn = document.getElementById('end-call');
+        
+        // State
+        let localStream = null;
+        let isVideoOn = true;
+        let isMicOn = true;
+        const remoteStreams = {};
+        
+        // Show error message
+        function showError(message) {
+            videoContainer.innerHTML = `
+                <div class="alert alert-danger m-3">
+                    <h4>Error</h4>
+                    <p>${message}</p>
+                    <button class="btn btn-primary" onclick="window.location.href='../dashboard.php'">
+                        Return to Dashboard
+                    </button>
+                </div>`;
+        }
+        
+        // Show success message
+        function showSuccess(message) {
+            const alert = document.createElement('div');
+            alert.className = 'alert alert-success m-3';
+            alert.innerHTML = message;
+            videoContainer.prepend(alert);
+            setTimeout(() => alert.remove(), 3000);
+        }
+        
+        // Initialize the meeting
+        async function initMeeting() {
+            try {
+                if (!zg) {
+                    throw new Error('Video engine not initialized');
+                }
+
+                // Show loading state
+                videoContainer.innerHTML = `
+                    <div class="loading">
+                        <div class="spinner-border text-primary mb-3" role="status">
+                            <span class="visually-hidden">Loading...</span>
+                        </div>
+                        <p>Connecting to meeting room...</p>
+                    </div>`;
+
+                // Login to ZEGOCLOUD room
+                try {
+                    await zg.loginRoom(meetingId, tokenInfo.signature, { 
+                        userID: userInfo.userID,
+                        userName: userInfo.userName
+                    });
+                    console.log('Successfully joined room:', meetingId);
+                } catch (error) {
+                    throw new Error(`Failed to join room: ${error.message}`);
+                }
+                
+                // Request camera and microphone permissions
+                try {
+                    videoContainer.innerHTML = `
+                        <div class="loading">
+                            <div class="spinner-border text-primary mb-3" role="status">
+                                <span class="visually-hidden">Loading...</span>
+                            </div>
+                            <p>Requesting camera and microphone access...</p>
+                        </div>`;
+                    
+                    // Create local stream with user media
+                    localStream = await navigator.mediaDevices.getUserMedia({
+                        video: true,
+                        audio: true
+                    });
+                    
+                    // Create video element for local stream
+                    const localVideo = createVideoElement(userInfo.userID, userInfo.userName, true);
+                    
+                    // Publish local stream
+                    await zg.startPublishingStream('local_stream', localStream);
+                    await zg.startPlayingStream('local_stream', localVideo);
+                    
+                    console.log('Local stream started');
+                } catch (error) {
+                    if (error.name === 'NotAllowedError') {
+                        throw new Error('Camera/microphone access was denied. Please allow access to continue.');
+                    } else if (error.name === 'NotFoundError') {
+                        throw new Error('No camera/microphone found. Please check your device.');
+                    } else {
+                        throw new Error(`Failed to access media devices: ${error.message}`);
+                    }
+                }
+                
+                // Clear loading state
+                videoContainer.innerHTML = '';
+                
+                // Handle remote streams
+                zg.on('roomStreamUpdate', async (roomID, updateType, streamList) => {
+                    console.log('Stream update:', updateType, streamList);
+                    
+                    if (updateType === 'ADD') {
+                        for (const stream of streamList) {
+                            if (stream.streamID !== 'local_stream' && !remoteStreams[stream.streamID]) {
+                                try {
+                                    const remoteVideo = createVideoElement(
+                                        stream.user.userID, 
+                                        stream.user.userName, 
+                                        false
+                                    );
+                                    await zg.startPlayingStream(stream.streamID, remoteVideo);
+                                    remoteStreams[stream.streamID] = remoteVideo;
+                                    showSuccess(`${stream.user.userName || 'A participant'} has joined`);
+                                } catch (error) {
+                                    console.error('Failed to play remote stream:', error);
+                                }
+                            }
+                        }
+                    } else if (updateType === 'DELETE') {
+                        for (const stream of streamList) {
+                            if (remoteStreams[stream.streamID]) {
+                                try {
+                                    await zg.stopPlayingStream(stream.streamID);
+                                    const videoElement = document.getElementById(`video-${stream.streamID}`);
+                                    if (videoElement) videoElement.remove();
+                                    delete remoteStreams[stream.streamID];
+                                } catch (error) {
+                                    console.error('Error removing remote stream:', error);
+                                }
+                            }
+                        }
+                    }
+                });
+                
+                // Handle connection state changes
+                zg.on('roomStateUpdate', (roomID, state, errorCode, extendedData) => {
+                    console.log('Room state updated:', state, errorCode, extendedData);
+                    
+                    if (state === 'DISCONNECTED' || state === 'CONNECT_FAILURE') {
+                        const errorMessage = extendedData?.message || 'Connection error';
+                        showError(`Connection lost: ${errorMessage}`);
+                    } else if (state === 'CONNECTING') {
+                        videoContainer.innerHTML = `
+                            <div class="loading">
+                                <div class="spinner-border text-primary mb-3" role="status">
+                                    <span class="visually-hidden">Loading...</span>
+                                </div>
+                                <p>Reconnecting to meeting...</p>
+                            </div>`;
+                    } else if (state === 'CONNECTED') {
+                        // Connection restored
+                        showSuccess('Connection restored');
+                    }
+                });
+                
+                // Show controls
+                document.getElementById('controls').style.display = 'flex';
+                
+            } catch (error) {
+                console.error('Meeting initialization failed:', error);
+                showError(`Failed to start meeting: ${error.message}`);
+                
+                // Clean up resources
+                if (zg) {
+                    try {
+                        await zg.logoutRoom(meetingId);
+                    } catch (e) {
+                        console.error('Error during cleanup:', e);
+                    }
+                }
+                
+                if (localStream) {
+                    localStream.getTracks().forEach(track => track.stop());
+                }
+            }
+        }
+        
+        // Create a video element for a stream
+        function createVideoElement(userId, userName, isLocal) {
+            const videoItem = document.createElement('div');
+            videoItem.className = 'video-item';
+            videoItem.id = `video-${userId}`;
+            
+            // Create video element
+            const video = document.createElement('video');
+            video.autoplay = true;
+            video.playsInline = true;
+            video.muted = isLocal;
+            video.className = 'video-element';
+            
+            // Create user info overlay
+            const userInfo = document.createElement('div');
+            userInfo.className = 'user-info';
+            userInfo.textContent = userName + (isLocal ? ' (You)' : '');
+            
+            // Create status indicator
+            const statusIndicator = document.createElement('div');
+            statusIndicator.className = 'status-indicator';
+            statusIndicator.innerHTML = `
+                <span class="badge bg-${isLocal ? 'info' : 'success'}">
+                    <i class="fas fa-${isLocal ? 'user' : 'user-friends'}"></i>
+                </span>
+            `;
+            
+            // Create controls container
+            const controls = document.createElement('div');
+            controls.className = 'video-controls';
+            controls.style.display = 'none'; // Hide by default, show on hover
+            
+            // Append all elements
+            videoItem.appendChild(video);
+            videoItem.appendChild(userInfo);
+            videoItem.appendChild(statusIndicator);
+            videoItem.appendChild(controls);
+            
+            // Add hover effect to show controls
+            videoItem.addEventListener('mouseenter', () => {
+                controls.style.display = 'block';
+            });
+            
+            videoItem.addEventListener('mouseleave', () => {
+                controls.style.display = 'none';
+            });
+            
+            // Add to container
+            videoContainer.appendChild(videoItem);
+            
+            // Make video item draggable
+            makeDraggable(videoItem);
+            
+            return video;
+        }
+        
+        // Make video elements draggable
+        function makeDraggable(element) {
+            let pos1 = 0, pos2 = 0, pos3 = 0, pos4 = 0;
+            
+            element.onmousedown = dragMouseDown;
+            
+            function dragMouseDown(e) {
+                e = e || window.event;
+                e.preventDefault();
+                // Get the mouse cursor position at startup
+                pos3 = e.clientX;
+                pos4 = e.clientY;
+                document.onmouseup = closeDragElement;
+                // Call a function whenever the cursor moves
+                document.onmousemove = elementDrag;
+            }
+            
+            function elementDrag(e) {
+                e = e || window.event;
+                e.preventDefault();
+                // Calculate the new cursor position
+                pos1 = pos3 - e.clientX;
+                pos2 = pos4 - e.clientY;
+                pos3 = e.clientX;
+                pos4 = e.clientY;
+                // Set the element's new position
+                element.style.top = (element.offsetTop - pos2) + "px";
+                element.style.left = (element.offsetLeft - pos1) + "px";
+                element.style.position = 'absolute';
+            }
+            
+            function closeDragElement() {
+                // Stop moving when mouse button is released
+                document.onmouseup = null;
+                document.onmousemove = null;
+            }
+        }
+        
+        // Toggle video on/off
+        toggleVideoBtn.addEventListener('click', async () => {
+            try {
+                if (!localStream) return;
+                
+                isVideoOn = !isVideoOn;
+                const videoTrack = localStream.getVideoTracks()[0];
+                if (!videoTrack) return;
+                
+                videoTrack.enabled = isVideoOn;
+                toggleVideoBtn.innerHTML = isVideoOn ? 
+                    '<i class="fas fa-video"></i>' : 
+                    '<i class="fas fa-video-slash text-danger"></i>';
+                toggleVideoBtn.classList.toggle('btn-outline-danger', !isVideoOn);
+                
+                // Show/hide video placeholder
+                const localVideo = document.querySelector('.video-item:first-child');
+                if (localVideo) {
+                    const videoElement = localVideo.querySelector('video');
+                    if (videoElement) {
+                        videoElement.style.display = isVideoOn ? 'block' : 'none';
+                        
+                        // Show placeholder when video is off
+                        let placeholder = localVideo.querySelector('.video-placeholder');
+                        if (!isVideoOn && !placeholder) {
+                            placeholder = document.createElement('div');
+                            placeholder.className = 'video-placeholder';
+                            placeholder.innerHTML = `
+                                <div class="user-initials">
+                                    ${getInitials(userInfo.userName || 'You')}
+                                </div>`;
+                            localVideo.insertBefore(placeholder, videoElement);
+                        } else if (isVideoOn && placeholder) {
+                            placeholder.remove();
+                        }
+                    }
+                }
+                
+                showSuccess(`Video ${isVideoOn ? 'enabled' : 'disabled'}`);
+            } catch (error) {
+                console.error('Error toggling video:', error);
+                showError('Failed to toggle video');
+            }
+        });
+        
+        // Toggle microphone on/off
+        toggleMicBtn.addEventListener('click', async () => {
+            try {
+                if (!localStream) return;
+                
+                isMicOn = !isMicOn;
+                const audioTrack = localStream.getAudioTracks()[0];
+                if (!audioTrack) return;
+                
+                audioTrack.enabled = isMicOn;
+                toggleMicBtn.innerHTML = isMicOn ? 
+                    '<i class="fas fa-microphone"></i>' : 
+                    '<i class="fas fa-microphone-slash text-danger"></i>';
+                toggleMicBtn.classList.toggle('btn-outline-danger', !isMicOn);
+                showSuccess(`Microphone ${isMicOn ? 'enabled' : 'muted'}`);
+                
+            } catch (error) {
+                console.error('Error toggling microphone:', error);
+                showError('Failed to toggle microphone');
+            }
+        });
+        
+        // End the meeting
+        endCallBtn.addEventListener('click', () => {
+            if (confirm('Are you sure you want to end the meeting?')) {
+                endMeeting();
+            }
+        });
+        
+        // Handle page unload
+        let isUnloading = false;
+        window.addEventListener('beforeunload', (e) => {
+            if (!isUnloading) {
+                endMeeting();
+                isUnloading = true;
+            }
+        });
+        
+        // Function to end the meeting
+        async function endMeeting() {
+            try {
+                // Show loading state
+                document.body.innerHTML = `
+                    <div class="d-flex justify-content-center align-items-center" style="height: 100vh;">
+                        <div class="text-center">
+                            <div class="spinner-border text-primary mb-3" role="status">
+                                <span class="visually-hidden">Loading...</span>
+                            </div>
+                            <p>Ending meeting and cleaning up resources...</p>
+                        </div>
+                    </div>`;
+                
+                // Stop all remote streams
+                const stopPromises = Object.keys(remoteStreams).map(async (streamId) => {
+                    try {
+                        await zg.stopPlayingStream(streamId);
+                        const videoElement = document.getElementById(`video-${streamId}`);
+                        if (videoElement) videoElement.remove();
+                    } catch (error) {
+                        console.error('Error stopping remote stream:', error);
+                    }
+                });
+                
+                // Stop local stream
+                if (localStream) {
+                    localStream.getTracks().forEach(track => {
+                        try {
+                            track.stop();
+                        } catch (e) {
+                            console.error('Error stopping track:', e);
+                        }
+                    });
+                }
+                
+                // Wait for all streams to stop
+                await Promise.all(stopPromises);
+                
+                // Leave the room
+                if (zg) {
+                    try {
+                        await zg.logoutRoom(meetingId);
+                        console.log('Successfully left the room');
+                    } catch (error) {
+                        console.error('Error leaving room:', error);
+                    }
+                }
+                
+                // Update meeting status in database
+                try {
+                    const response = await fetch('update_participant_status.php', {
+                        method: 'POST',
+                        headers: {
+                            'Content-Type': 'application/json',
+                        },
+                        body: JSON.stringify({
+                            meeting_id: meetingId,
+                            user_id: userInfo.userID,
+                            status: 'left'
+                        })
+                    });
+                    
+                    if (!response.ok) {
+                        throw new Error('Failed to update participant status');
+                    }
+                } catch (error) {
+                    console.error('Error updating participant status:', error);
+                }
+                
+                // Redirect based on user role
+                const redirectUrl = userInfo.role === 'admin' ? '../admin/dashboard.php' : '../dashboard.php';
+                window.location.href = redirectUrl;
+                
+            } catch (error) {
+                console.error('Error ending meeting:', error);
+                // Still try to redirect even if there was an error
+                const redirectUrl = userInfo.role === 'admin' ? '../admin/dashboard.php' : '../dashboard.php';
+                window.location.href = redirectUrl;
+            }
+        }
+        
+        // Start the meeting when the page loads
+        document.addEventListener('DOMContentLoaded', () => {
+            initMeeting().catch(error => {
+                console.error('Failed to initialize meeting:', error);
+                showError(`Failed to start meeting: ${error.message}`);
+            });
+        });
+    </script>
+    
+    <!-- Font Awesome for icons -->
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+    
+    <style>
+        /* Add your custom styles here */
+        .video-container {
+            display: grid;
+            grid-template-columns: repeat(auto-fill, minmax(300px, 1fr));
+            gap: 1rem;
+            padding: 1rem;
+        }
+        
+        .video-item {
+            position: relative;
+            background: #000;
+            border-radius: 8px;
+            overflow: hidden;
+            aspect-ratio: 16/9;
+        }
+        
+        .video-item video {
+            width: 100%;
+            height: 100%;
+            object-fit: cover;
+        }
+        
+        .user-info {
+            position: absolute;
+            bottom: 0;
+            left: 0;
+            right: 0;
+            background: rgba(0, 0, 0, 0.7);
+            color: white;
+            padding: 0.5rem;
+            font-size: 0.9rem;
+        }
+        
+        .status-indicator {
+            position: absolute;
+            top: 0.5rem;
+            right: 0.5rem;
+        }
+        
+        .video-placeholder {
+            position: absolute;
+            top: 0;
+            left: 0;
+            right: 0;
+            bottom: 0;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            background: #333;
+            color: white;
+            font-size: 2rem;
+        }
+        
+        .user-initials {
+            width: 80px;
+            height: 80px;
+            border-radius: 50%;
+            background: #555;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-weight: bold;
+        }
+        
+        #controls {
+            position: fixed;
+            bottom: 1rem;
+            left: 50%;
+            transform: translateX(-50%);
+            display: flex;
+            gap: 1rem;
+            background: rgba(0, 0, 0, 0.7);
+            padding: 0.75rem 1.5rem;
+            border-radius: 50px;
+            z-index: 1000;
+        }
+        
+        #controls button {
+            width: 50px;
+            height: 50px;
+            border-radius: 50%;
+            border: none;
+            background: #444;
+            color: white;
+            font-size: 1.2rem;
+            cursor: pointer;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            transition: all 0.2s;
+        }
+        
+        #controls button:hover {
+            background: #666;
+            transform: scale(1.1);
+        }
+        
+        #controls button.btn-outline-danger {
+            background: rgba(220, 53, 69, 0.2);
+            color: #dc3545;
+        }
+        
+        #end-call {
+            background: #dc3545 !important;
+        }
+        
+        .loading {
+            position: fixed;
+            top: 0;
+            left: 0;
+            right: 0;
+            bottom: 0;
+            background: rgba(0, 0, 0, 0.8);
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            color: white;
+            z-index: 2000;
+        }
+        
+        .alert {
+            position: fixed;
+            top: 1rem;
+            left: 50%;
+            transform: translateX(-50%);
+            z-index: 2000;
+            animation: fadeIn 0.3s ease-in-out;
+        }
+        
+        @keyframes fadeIn {
+            from { opacity: 0; transform: translate(-50%, -20px); }
+            to { opacity: 1; transform: translate(-50%, 0); }
+        }
+    </style>
+</body>
+</html>
+        // End the meeting
+        endCallBtn.addEventListener('click', () => {
+            if (confirm('Are you sure you want to end the meeting?')) {
+                endMeeting();
+            }
+        });
+        
+        // Handle page unload
+        let isUnloading = false;
+        window.addEventListener('beforeunload', (e) => {
+            if (!isUnloading) {
+                endMeeting();
+                isUnloading = true;
+            }
+        });
+        
+        // Function to end the meeting
+        async function endMeeting() {
+            try {
+                // Show loading state
+                document.body.innerHTML = `
+                    <div class="d-flex justify-content-center align-items-center" style="height: 100vh;">
+                        <div class="text-center">
+                            <div class="spinner-border text-primary mb-3" role="status">
+                                <span class="visually-hidden">Loading...</span>
+                            </div>
+                            <p>Ending meeting and cleaning up resources...</p>
+                        </div>
+                    </div>`;
+                
+                // Stop all remote streams
+                const stopPromises = Object.keys(remoteStreams).map(async (streamId) => {
+                    try {
+                        await zg.stopPlayingStream(streamId);
+                        const videoElement = document.getElementById(`video-${streamId}`);
+                        if (videoElement) videoElement.remove();
+                    } catch (error) {
+                        console.error('Error stopping remote stream:', error);
+                    }
+                });
+                
+                // Stop local stream
+                if (localStream) {
+                    localStream.getTracks().forEach(track => {
+                        try {
+                            track.stop();
+                        } catch (e) {
+                            console.error('Error stopping track:', e);
+                        }
+                    });
+                }
+                
+                // Wait for all streams to stop
+                await Promise.all(stopPromises);
+                
+                // Leave the room
+                if (zg) {
+                    try {
+                        await zg.logoutRoom(meetingId);
+                        console.log('Successfully left the room');
+                    } catch (error) {
+                        console.error('Error leaving room:', error);
+                    }
+                }
+                
+                // Update meeting status in database
+                try {
+                    const response = await fetch('update_participant_status.php', {
+                        method: 'POST',
+                        headers: {
+                            'Content-Type': 'application/json',
+                        },
+                        body: JSON.stringify({
+                            meeting_id: meetingId,
+                            user_id: userInfo.userID,
+                            status: 'left'
+                        })
+                    });
+                    
+                    if (!response.ok) {
+                        throw new Error('Failed to update participant status');
+                    }
+                } catch (error) {
+                    console.error('Error updating participant status:', error);
+                }
+                
+                // Redirect based on user role
+                const redirectUrl = userInfo.role === 'admin' ? '../admin/dashboard.php' : '../dashboard.php';
+                window.location.href = redirectUrl;
+                
+            } catch (error) {
+                console.error('Error ending meeting:', error);
+                // Still try to redirect even if there was an error
+                const redirectUrl = userInfo.role === 'admin' ? '../admin/dashboard.php' : '../dashboard.php';
+                window.location.href = redirectUrl;
+            }
+        }
+        
+        // Start the meeting when the page loads
+        document.addEventListener('DOMContentLoaded', () => {
+            initMeeting().catch(error => {
+                console.error('Failed to initialize meeting:', error);
+                showError(`Failed to start meeting: ${error.message}`);
+            });
+        });
+        // Start the meeting
+        document.addEventListener('DOMContentLoaded', initMeeting);
+    </script>
+    
+    <!-- Font Awesome for icons -->
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+</body>
+</html>

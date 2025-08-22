@@ -1,0 +1,38 @@
+services:
+  - type: web
+    name: coaching-center
+    env: php
+    build:
+      buildCommand: "./build.sh"
+      dockerfile: "./Dockerfile"
+    envVars:
+      - key: APP_ENV
+        value: production
+      - key: DB_HOST
+        fromDatabase:
+          name: coaching-center-db
+          property:connectionString
+          envVarName: DATABASE_URL
+      - key: DB_NAME
+        fromDatabase:
+          name: coaching-center-db
+          property:database
+      - key: DB_USER
+        fromDatabase:
+          name: coaching-center-db
+          property:user
+      - key: DB_PASSWORD
+        fromDatabase:
+          name: coaching-center-db
+          property:password
+    autoDeploy: true
+
+databases:
+  - name: coaching-center-db
+    databaseName: coaching_center
+    user: coaching_user
+    plan: free
+    ipAllowList:
+      - group: "all"
+        description: "All IPs"
+        mask: "0.0.0.0/0"

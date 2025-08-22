@@ -1,0 +1,282 @@
+<?php
+require_once __DIR__ . '/../config/config.php';
+require_once __DIR__ . '/../includes/auth_functions.php';
+
+// Ensure user is logged in and is an admin
+requireAdmin();
+
+$page_title = 'Bulk Upload Students';
+$success = '';
+$error = '';
+
+// Handle file upload
+if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_FILES['student_file'])) {
+    $file = $_FILES['student_file'];
+    
+    // Check for errors
+    if ($file['error'] === UPLOAD_ERR_OK) {
+        $file_ext = strtolower(pathinfo($file['name'], PATHINFO_EXTENSION));
+        
+        // Check file extension
+        if (!in_array($file_ext, ['xlsx', 'xls', 'csv'])) {
+            $error = 'Invalid file format. Please upload an Excel file (.xlsx, .xls, or .csv)';
+        } else {
+            // Read the CSV file
+            $handle = fopen($file['tmp_name'], 'r');
+            if ($handle === false) {
+                $error = 'Could not open the uploaded file.';
+            } else {
+                // Read the header row
+                $header = fgetcsv($handle);
+                if ($header === false) {
+                    $error = 'Could not read the header row from the CSV file.';
+                    fclose($handle);
+                } else {
+                    // Clean and validate header
+                    $header = array_map('trim', array_map('strval', $header));
+                    $expected_header = ['Full Name *', 'Email Address *', 'Phone Number', 'Course ID *'];
+                    
+                    // Check if required columns exist (case insensitive)
+                    $header_lower = array_map('strtolower', $header);
+                    $expected_lower = array_map('strtolower', $expected_header);
+                    
+                    $missing_columns = [];
+                    foreach ($expected_lower as $i => $col) {
+                        if (!in_array($col, $header_lower)) {
+                            $missing_columns[] = $expected_header[$i];
+                        }
+                    }
+                    
+                    if (!empty($missing_columns)) {
+                        $error = 'Missing required columns: ' . implode(', ', $missing_columns) . '. Please use the template.';
+                        fclose($handle);
+                    } else {
+                        // Map column indices
+                        $col_map = [
+                            'name' => array_search(strtolower($expected_header[0]), $header_lower),
+                            'email' => array_search(strtolower($expected_header[1]), $header_lower),
+                            'phone' => array_search(strtolower($expected_header[2]), $header_lower),
+                            'course_id' => array_search(strtolower($expected_header[3]), $header_lower)
+                        ];
+                        
+                        // Read all rows
+                        $rows = [];
+                        while (($row = fgetcsv($handle)) !== false) {
+                            // Skip empty rows
+                            if (empty(array_filter($row, function($v) { return $v !== null && $v !== ''; }))) {
+                                continue;
+                            }
+                            $rows[] = $row;
+                        }
+                        fclose($handle);
+                        
+                        if (empty($rows)) {
+                            $error = 'No data found in the uploaded file.';
+                        } else {
+                            // Start transaction
+                            $conn->begin_transaction();
+                            
+                            try {
+                                $user_stmt = $conn->prepare("INSERT INTO users (name, email, phone, password, role, status, created_at) VALUES (?, ?, ?, ?, 'student', 'active', NOW())");
+                                $enroll_stmt = $conn->prepare("INSERT INTO enrollments (student_id, course_id, enrollment_date, status) VALUES (?, ?, CURDATE(), 'active')");
+                
+                                // Process each row
+                                $imported = 0;
+                                $skipped = 0;
+                                $errors = [];
+                                $emails_sent = [];
+                                $emails_failed = [];
+
+                                foreach ($rows as $index => $row) {
+                                    // Skip empty rows
+                                    if (empty(array_filter($row, function($v) { return $v !== null && $v !== ''; }))) {
+                                        continue;
+                                    }
+
+                                    // Map columns based on header
+                                    $name = trim($row[$col_map['name']] ?? '');
+                                    $email = strtolower(trim($row[$col_map['email']] ?? ''));
+                                    $phone = trim($row[$col_map['phone']] ?? '');
+                                    $course_id = trim($row[$col_map['course_id']] ?? '');
+
+                                    // Validate required fields
+                                    if (empty($name) || empty($email)) {
+                                        $errors[] = "Row " . ($index + 2) . ": Missing required fields (Name and Email are required)";
+                                        $skipped++;
+                                        continue;
+                                    }
+
+                                    // Validate email format
+                                    if (!filter_var($email, FILTER_VALIDATE_EMAIL)) {
+                                        $errors[] = "Row " . ($index + 2) . ": Invalid email format: $email";
+                                        $skipped++;
+                                        continue;
+                                    }
+
+                                    // Validate course exists
+                                    $course_check = $conn->prepare("SELECT id FROM courses WHERE id = ? AND status = 'active'");
+                                    $course_check->bind_param("i", $course_id);
+                                    $course_check->execute();
+                                    $course_check->store_result();
+                                    
+                                    if ($course_check->num_rows === 0) {
+                                        $errors[] = "Row " . ($index + 2) . ": Invalid Course ID: $course_id";
+                                        $skipped++;
+                                        continue;
+                                    }
+
+                                    // Check if email already exists
+                                    $check = $conn->prepare("SELECT id FROM users WHERE email = ?");
+                                    $check->bind_param("s", $email);
+                                    $check->execute();
+                                    $check->store_result();
+                                    
+                                    if ($check->num_rows > 0) {
+                                        $errors[] = "Row " . ($index + 2) . ": Email '$email' already exists";
+                                        $skipped++;
+                                        continue;
+                                    }
+
+                                    // Generate a random password
+                                    $password = bin2hex(random_bytes(8));
+                                    $hashed_password = password_hash($password, PASSWORD_DEFAULT);
+
+                                    // Insert user
+                                    $user_stmt->bind_param("ssss", $name, $email, $phone, $hashed_password);
+                                    if ($user_stmt->execute()) {
+                                        $user_id = $conn->insert_id;
+                                        
+                                        // Enroll student in course
+                                        $enroll_stmt->bind_param("ii", $user_id, $course_id);
+                                        if ($enroll_stmt->execute()) {
+                                            $imported++;
+                                            
+                                            // Send welcome email
+                                            $to = $email;
+                                            $subject = "Welcome to " . SITE_NAME;
+                                            $message = "Hello $name,\n\n";
+                                            $message .= "Your account has been created with the following credentials:\n";
+                                            $message .= "Email: $email\n";
+                                            $message .= "Password: $password\n\n";
+                                            $message .= "You can log in at: " . SITE_URL . "/student/login.php\n\n";
+                                            $message .= "Please change your password after logging in.\n\n";
+                                            $message .= "Regards,\n" . SITE_NAME . " Team";
+                                            
+                                            $headers = "From: " . SITE_EMAIL . "\r\n";
+                                            $headers .= "Reply-To: " . SITE_EMAIL . "\r\n";
+                                            $headers .= "X-Mailer: PHP/" . phpversion();
+                                            
+                                            if (mail($to, $subject, $message, $headers)) {
+                                                $emails_sent[] = $email;
+                                            } else {
+                                                $emails_failed[] = $email;
+                                            }
+                                        }
+                                    }
+                                }
+
+                                // Commit transaction if we've made it this far without errors
+                                $conn->commit();
+
+                                // Prepare success message with email status
+                                $success = "Successfully imported $imported students. ";
+                                if ($skipped > 0) {
+                                    $success .= "$skipped rows skipped. ";
+                                }
+                                if (!empty($emails_sent)) {
+                                    $success .= count($emails_sent) . " welcome emails sent. ";
+                                }
+                                if (!empty($emails_failed)) {
+                                    $success .= count($emails_failed) . " emails failed to send. ";
+                                }
+                                
+                                if (!empty($errors)) {
+                                    $error = implode("<br>", $errors);
+                                }
+                                
+                            } catch (Exception $e) {
+                                // Rollback transaction on error
+                                $conn->rollback();
+                                $error = "Error: " . $e->getMessage();
+                            }
+                        }
+                    }
+                }
+            }
+        } else {
+            $error = 'Error uploading file. Please try again.';
+        }
+    }
+}
+
+// Include header
+include '../includes/header.php';
+?>
+
+<div class="container-fluid">
+    <div class="row">
+        <div class="col-md-12">
+            <div class="card">
+                <div class="card-header">
+                    <h4 class="card-title">Bulk Upload Students</h4>
+                </div>
+                <div class="card-body">
+                    <?php if (!empty($success)): ?>
+                        <div class="alert alert-success">
+                            <?php echo $success; ?>
+                        </div>
+                    <?php endif; ?>
+                    
+                    <?php if (!empty($error)): ?>
+                        <div class="alert alert-danger">
+                            <?php echo $error; ?>
+                        </div>
+                    <?php endif; ?>
+                    
+                    <div class="row">
+                        <div class="col-md-6">
+                            <div class="card">
+                                <div class="card-header">
+                                    <h5 class="card-title">Upload Students</h5>
+                                </div>
+                                <div class="card-body">
+                                    <form method="post" enctype="multipart/form-data">
+                                        <div class="form-group">
+                                            <label for="student_file">Select CSV/Excel File</label>
+                                            <input type="file" class="form-control-file" id="student_file" name="student_file" accept=".csv, .xlsx, .xls" required>
+                                            <small class="form-text text-muted">
+                                                <a href="download_student_template.php" class="btn btn-link btn-sm p-0">Download Template</a>
+                                            </small>
+                                        </div>
+                                        <button type="submit" class="btn btn-primary">Upload</button>
+                                        <a href="students.php" class="btn btn-secondary">Back to Students</a>
+                                    </form>
+                                </div>
+                            </div>
+                        </div>
+                        <div class="col-md-6">
+                            <div class="card">
+                                <div class="card-header">
+                                    <h5 class="card-title">Instructions</h5>
+                                </div>
+                                <div class="card-body">
+                                    <ol>
+                                        <li>Download the template using the link above</li>
+                                        <li>Fill in the student details</li>
+                                        <li>Save the file in CSV format</li>
+                                        <li>Upload the file using the form on the left</li>
+                                    </ol>
+                                    <p class="text-muted">
+                                        <strong>Note:</strong> Required fields are marked with an asterisk (*).
+                                    </p>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+</div>
+
+<?php include '../includes/footer.php'; ?>
