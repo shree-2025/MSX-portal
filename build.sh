@@ -1,26 +1,50 @@
 #!/bin/bash
 set -e
 
-# Install dependencies
+# Update and install system dependencies
+echo "Updating system packages..."
+apt-get update
+
+# Install PHP extensions and dependencies
+echo "Installing PHP extensions..."
+apt-get install -y \
+    libfreetype6-dev \
+    libjpeg62-turbo-dev \
+    libpng-dev \
+    libzip-dev \
+    zlib1g-dev \
+    libicu-dev \
+    libonig-dev \
+    libxml2-dev
+
+# Install Composer dependencies
+echo "Installing Composer dependencies..."
 composer install --no-interaction --optimize-autoloader --no-dev
 
-# Set permissions
-chmod -R 777 storage/
-chmod -R 777 bootstrap/cache/
+# Set directory permissions
+echo "Setting up permissions..."
+chown -R www-data:www-data storage/
+chown -R www-data:www-data bootstrap/cache/
+chmod -R 775 storage/
+chmod -R 775 bootstrap/cache/
 
 # Generate application key if not exists
 if [ ! -f .env ]; then
+    echo "Creating .env file..."
     cp .env.example .env
     php artisan key:generate
 fi
 
-# Clear caches
+# Clear and optimize application
+echo "Optimizing application..."
 php artisan config:clear
 php artisan cache:clear
 php artisan view:clear
 php artisan route:clear
-
-# Optimize
 php artisan config:cache
 php artisan route:cache
 php artisan view:cache
+
+# Run database migrations
+echo "Running database migrations..."
+php artisan migrate --force

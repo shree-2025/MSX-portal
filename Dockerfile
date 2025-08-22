@@ -56,8 +56,13 @@ RUN retry apt-get update && retry apt-get install -y --no-install-recommends \
     libjpeg62-turbo-dev \
     libpng-dev \
     libzip-dev \
+    zlib1g-dev \
+    libicu-dev \
+    libonig-dev \
+    libxml2-dev \
     && docker-php-ext-configure gd --with-freetype --with-jpeg \
-    && docker-php-ext-install -j$(nproc) pdo_mysql mbstring exif pcntl bcmath gd zip opcache
+    && docker-php-ext-configure intl \
+    && docker-php-ext-install -j$(nproc) pdo_mysql mbstring exif pcntl bcmath gd zip opcache intl
 
 # Install and enable PHP-FPM
 RUN apt-get install -y php8.1-fpm \
