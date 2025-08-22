@@ -1,25 +1,71 @@
 # Use the official PHP 8.1 Apache image
 FROM php:8.1-apache
 
-# Install system dependencies
-RUN apt-get update && apt-get install -y \
+# Set environment variables for non-interactive installation
+ENV DEBIAN_FRONTEND=noninteractive
+
+# Function to retry failed commands
+RUN echo 'retry() { \
+    local n=0; \
+    local max=3; \
+    local delay=5; \
+    while true; do \
+        "$@" && break || { \
+            if [[ $n -lt $max ]]; then \
+                ((n++)); \
+                echo "Command failed. Attempt $n/$max:"; \
+                sleep $delay; \
+            else \
+                echo "The command has failed after $n attempts." >&2; \
+                return 1; \
+            fi; \
+        }; \
+    done; \
+}' > /usr/local/bin/retry && \
+    chmod +x /usr/local/bin/retry
+
+# Update package list and install basic dependencies
+RUN retry apt-get update && retry apt-get install -y --no-install-recommends \
+    ca-certificates \
+    gnupg \
+    apt-transport-https \
+    lsb-release \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install system dependencies in smaller batches
+RUN retry apt-get update && retry apt-get install -y --no-install-recommends \
     git \
     curl \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN retry apt-get update && retry apt-get install -y --no-install-recommends \
     libpng-dev \
     libonig-dev \
     libxml2-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN retry apt-get update && retry apt-get install -y --no-install-recommends \
     zip \
     unzip \
-    libzip-dev
+    libzip-dev \
+    && rm -rf /var/lib/apt/lists/*
 
-# Clear cache
-RUN apt-get clean && rm -rf /var/lib/apt/lists/*
+# Install PHP extensions and FPM
+RUN retry apt-get update && retry apt-get install -y --no-install-recommends \
+    libfreetype6-dev \
+    libjpeg62-turbo-dev \
+    libpng-dev \
+    libzip-dev \
+    && docker-php-ext-configure gd --with-freetype --with-jpeg \
+    && docker-php-ext-install -j$(nproc) pdo_mysql mbstring exif pcntl bcmath gd zip opcache
 
-# Install PHP extensions
-RUN docker-php-ext-install pdo_mysql mbstring exif pcntl bcmath gd zip
+# Install and enable PHP-FPM
+RUN apt-get install -y php8.1-fpm \
+    && a2enmod proxy_fcgi setenvif \
+    && a2enconf php8.1-fpm
 
 # Enable Apache modules
-RUN a2enmod rewrite headers
+RUN a2enmod rewrite headers ssl
 
 # Set working directory
 WORKDIR /var/www/html
@@ -30,13 +76,19 @@ COPY . /var/www/html
 # Install Composer
 COPY --from=composer:latest /usr/bin/composer /usr/bin/composer
 
+# Set permissions
+RUN chown -R www-data:www-data /var/www/html \
+    && chmod -R 775 /var/www/html/storage \
+    && chmod -R 775 /var/www/html/bootstrap/cache
+
 # Install dependencies
 RUN composer install --no-interaction --optimize-autoloader --no-dev
 
-# Set permissions
-RUN chown -R www-data:www-data /var/www/html \
-    && chmod -R 755 /var/www/html/storage \
-    && chmod -R 755 /var/www/html/bootstrap/cache
+# Generate application key and optimize
+RUN php artisan key:generate --force \
+    && php artisan config:cache \
+    && php artisan route:cache \
+    && php artisan view:cache
 
 # Update Apache configuration
 COPY docker/apache.conf /etc/apache2/sites-available/000-default.conf
