@@ -5,17 +5,24 @@ set -e
 echo "Updating system packages..."
 apt-get update
 
-# Install PHP extensions and dependencies
-echo "Installing PHP extensions..."
-apt-get install -y \
+# Install required system packages
+echo "Installing system dependencies..."
+apt-get install -y --no-install-recommends \
+    build-essential \
+    libssl-dev \
+    libpcre3 \
+    libpcre3-dev \
+    zlib1g \
+    zlib1g-dev \
+    libzip-dev \
+    libicu-dev \
+    libonig-dev \
+    libxml2-dev \
     libfreetype6-dev \
     libjpeg62-turbo-dev \
     libpng-dev \
-    libzip-dev \
-    zlib1g-dev \
-    libicu-dev \
-    libonig-dev \
-    libxml2-dev
+    pkg-config \
+    libwebp-dev
 
 # Install Composer dependencies
 echo "Installing Composer dependencies..."

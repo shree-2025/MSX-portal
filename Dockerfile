@@ -50,19 +50,34 @@ RUN retry apt-get update && retry apt-get install -y --no-install-recommends \
     libzip-dev \
     && rm -rf /var/lib/apt/lists/*
 
-# Install PHP extensions and FPM
+# Install build dependencies first
 RUN retry apt-get update && retry apt-get install -y --no-install-recommends \
-    libfreetype6-dev \
-    libjpeg62-turbo-dev \
-    libpng-dev \
-    libzip-dev \
+    build-essential \
+    libssl-dev \
+    libpcre3 \
+    libpcre3-dev \
+    zlib1g \
     zlib1g-dev \
+    libzip-dev \
     libicu-dev \
     libonig-dev \
     libxml2-dev \
+    libfreetype6-dev \
+    libjpeg62-turbo-dev \
+    libpng-dev \
     && docker-php-ext-configure gd --with-freetype --with-jpeg \
     && docker-php-ext-configure intl \
-    && docker-php-ext-install -j$(nproc) pdo_mysql mbstring exif pcntl bcmath gd zip opcache intl
+    && docker-php-ext-install -j$(nproc) \
+        pdo_mysql \
+        mbstring \
+        exif \
+        pcntl \
+        bcmath \
+        gd \
+        zip \
+        opcache \
+        intl \
+    && docker-php-source delete
 
 # Install and enable PHP-FPM
 RUN apt-get install -y php8.1-fpm \
